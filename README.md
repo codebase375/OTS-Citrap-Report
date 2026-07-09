@@ -35,6 +35,7 @@ Help is appreciated for a further and properly fleshed out implementation.
 * Accept reports from EUD's for storage on the server with attachments
 * List all reports submitted to the server on the admin UI
 * Further dig down to individual reports for viewing/download/deletion
+* EUD's can search with all parameters for records stored on the server
 
 Thanks for looking, using, and contributing!
 
