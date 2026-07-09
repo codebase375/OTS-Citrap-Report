@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script>
+(function() {
+  try {
+    var v = localStorage.getItem('mantine-color-scheme');
+    var isDark = v === 'dark' || (v !== 'light' &&
+      window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    if (isDark) document.documentElement.setAttribute('data-theme', 'dark');
+  } catch (e) {}
+})();
+</script>
+<title>CI-TRAP Reports</title>
+<style>
+  :root {
+    --accent: #2b6cb0;
+    --bg: #f7f8fa;
+    --card-bg: #ffffff;
+    --border: #eaeaea;
+    --text: #1a1a2e;
+    --muted: #666;
+    --th-bg: #f0f1f5;
+    --row-hover: #fafbff;
+    --error: #c0392b;
+  }
+  [data-theme="dark"] {
+    --accent: #4dabf7;
+    --bg: #1a1b1e;
+    --card-bg: #25262b;
+    --border: #373a40;
+    --text: #c1c2c5;
+    --muted: #909296;
+    --th-bg: #2c2e33;
+    --row-hover: #2c2e33;
+    --error: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    margin: 0;
+    padding: 1.25rem;
+    background: var(--bg);
+    color: var(--text);
+  }
+  .header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+  h1 { font-size: 1.25rem; margin: 0; }
+  .subtitle { color: var(--muted); font-size: 0.85rem; }
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    overflow: hidden;
+  }
+  table { border-collapse: collapse; width: 100%; }
+  th, td {
+    text-align: left;
+    padding: 0.6rem 0.85rem;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.82rem;
+  }
+  th { background: var(--th-bg); font-weight: 600; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: var(--row-hover); }
+  .mono { font-family: ui-monospace, Consolas, monospace; font-size: 0.78rem; }
+  .empty, .loading, .error {
+    padding: 2.5rem 1rem;
+    text-align: center;
+    color: var(--muted);
+    font-size: 0.9rem;
+  }
+  .error { color: var(--error); }
+  .footer {
+    margin-top: 1rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.82rem;
+  }
+  a.btn {
+    color: var(--accent);
+    text-decoration: none;
+    font-weight: 500;
+  }
+  a.btn:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <div>
+      <h1>CI-TRAP Reports</h1>
+      <div class="subtitle" id="subtitle">Loading&hellip;</div>
+    </div>
+    <a class="btn" id="full-view-link" href="#" target="_top">Open full admin view &rarr;</a>
+  </div>
+
+  <div class="card">
+    <table id="table" style="display:none">
+      <thead>
+        <tr>
+          <th>ID</th><th>Client UID</th><th>Type</th><th>Callsign</th>
+          <th>Lat, Lon</th><th>Created</th><th>Attachments</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+    <div class="loading" id="status">Loading reports&hellip;</div>
+  </div>
+
+  <script>
+    // Same-origin data endpoint on the plugin's own blueprint - the
+    // browser sends the existing OTS session cookie automatically since
+    // this page is loaded from the same domain as OTS itself (just in an
+    // iframe), so no separate login/auth flow is needed here.
+    const DATA_URL = "/api/citrap-reports/data";
+    const FULL_VIEW_URL = "/api/citrap-reports";
+
+    document.getElementById("full-view-link").href = FULL_VIEW_URL;
+
+    function escapeHtml(value) {
+      if (value === null || value === undefined) return "";
+      return String(value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    fetch(DATA_URL, { credentials: "same-origin" })
+      .then(function (resp) {
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        return resp.json();
+      })
+      .then(function (data) {
+        const statusEl = document.getElementById("status");
+        const tableEl = document.getElementById("table");
+        const tbody = document.getElementById("tbody");
+        const subtitle = document.getElementById("subtitle");
+
+        subtitle.textContent = data.total + " total report" + (data.total === 1 ? "" : "s");
+
+        if (!data.reports || data.reports.length === 0) {
+          statusEl.textContent = "No reports yet.";
+          statusEl.className = "empty";
+          return;
+        }
+
+        data.reports.forEach(function (r) {
+          const tr = document.createElement("tr");
+          const latlon = (r.lat !== null && r.lat !== undefined && r.lon !== null && r.lon !== undefined)
+            ? r.lat.toFixed(5) + ", " + r.lon.toFixed(5)
+            : "\u2014";
+          tr.innerHTML =
+            '<td class="mono">' + escapeHtml(r.id) + "</td>" +
+            '<td class="mono">' + escapeHtml(r.clientUid) + "</td>" +
+            "<td>" + (escapeHtml(r.type) || "\u2014") + "</td>" +
+            "<td>" + (escapeHtml(r.callsign) || "\u2014") + "</td>" +
+            "<td>" + latlon + "</td>" +
+            "<td>" + (escapeHtml(r.createdAt) || "\u2014") + "</td>" +
+            "<td>" + (r.attachmentCount !== undefined ? r.attachmentCount : "\u2014") + "</td>";
+          tbody.appendChild(tr);
+        });
+
+        statusEl.style.display = "none";
+        tableEl.style.display = "table";
+      })
+      .catch(function (err) {
+        const statusEl = document.getElementById("status");
+        statusEl.textContent = "Couldn't load reports (" + err.message + "). Try the full admin view.";
+        statusEl.className = "error";
+      });
+  </script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "ots-citrap-report"
+description = "CI-TRAP Report API (get/put/delete/search/post report + attachments) as an OpenTAKServer plugin"
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/your-username/OTS-Citrap-Report-Plugin"
+version = "1.0.0"
+packages = [{ include = "ots_citrap_report" }]
+include = ["ots_citrap_report/ui/**/*"]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+
+[tool.poetry.plugins."opentakserver.plugin"]
+ots_citrap_report = "ots_citrap_report.app:OtsCitrapReport"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
