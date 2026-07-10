@@ -25,17 +25,21 @@ Postgres tables, installable through OTS's normal plugin flow.
   Matches OTS's own dark/light theme automatically.
 
 
-## This project heavily leveraged Claude for implementation and is still not perfect. ##
-
-Help is appreciated for a further and properly fleshed out implementation. 
-
-
-# Right now as it sits the plugin will: #
+## Right now as it sits the plugin will: #
 
 * Accept reports from EUD's for storage on the server with attachments
 * List all reports submitted to the server on the admin UI
 * Further dig down to individual reports for viewing/download/deletion
 * EUD's can search with all parameters for records stored on the server
+
+# This project heavily leveraged Claude for implementation and is still not perfect. #
+
+Problem Points:
+* The Admin UI won't cooperate with the plugin UI page
+
+Help is appreciated for a further and properly fleshed out implementation. 
+
+
 
 Thanks for looking, using, and contributing!
 
