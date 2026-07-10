@@ -94,11 +94,19 @@ class CitrapReport(db.Model):
     )
 
     def set_payload(self, payload: bytes):
-        """Store payload bytes and (re-)derive lat/lon from it."""
+        """Store payload bytes and (re-)derive lat/lon if it's bare CoT XML.
+
+        Real CI-TRAP payloads observed in practice are zips (handled by
+        the richer zip-metadata extraction in app.py, applied by the
+        route handlers after this call) - the CoT parse here only runs if
+        the payload actually looks like XML, so multi-MB binary zips
+        don't burn a guaranteed-to-fail parse attempt on every upload.
+        """
         self.payload = payload
-        latlon = extract_latlon_from_cot(payload)
-        if latlon:
-            self.lat, self.lon = latlon
+        if payload and payload.lstrip()[:1] == b"<":
+            latlon = extract_latlon_from_cot(payload)
+            if latlon:
+                self.lat, self.lon = latlon
 
     def to_dict(self, include_payload: bool = True) -> dict:
         d = {

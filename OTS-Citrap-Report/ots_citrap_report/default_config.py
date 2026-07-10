@@ -21,17 +21,21 @@ OTS_CITRAP_REPORT_URL_PREFIX = "/Marti/api/citrap"
 OTS_CITRAP_REPORT_ADMIN_UI_PREFIX = "/api/citrap-reports"
 
 # IMPORTANT: "GET /Marti/api/citrap" (searchReports) is the exact same path
-# and method OTS core already documents as natively supported. Werkzeug
-# won't error on the duplicate rule, but whichever view got registered
-# first (core's, since it loads before plugins) wins - this plugin's
-# searchReports route would silently never run. Default to NOT registering
-# it, so core's existing behavior is untouched, and only add the 5
-# operations core doesn't implement at all (get/put/delete/post/attachment).
-# Set this True only if you've confirmed (e.g. by testing) that your OTS
-# version's core citrap route is a stub/no-op you actually want overridden -
-# and even then, whether the override wins depends on plugin/blueprint
-# registration order in PluginManager, which isn't guaranteed.
-OTS_CITRAP_REPORT_OVERRIDE_SEARCH = False
+# and method OTS core already documents as natively supported - and
+# empirically confirmed (a real EUD's search returned nothing) to not know
+# about this plugin's report data, since core has no way to know this
+# plugin's table exists. Default is True: without this, EUD search is
+# broken on every install of this plugin. Implemented via a
+# before_app_request hook (see app.py) rather than a competing same-path
+# route - registering a second Flask route for the identical path does NOT
+# work, confirmed against real Werkzeug 3.x: whichever rule was added first
+# (core's, since it registers before any plugin loads) always wins the
+# match, with no supported way for a plugin to remove or override that from
+# outside Werkzeug's internals. before_app_request runs before route
+# dispatch for every request regardless of which rule Werkzeug matched, so
+# it reliably wins instead - this is no longer a "best effort, might not
+# take priority" situation.
+OTS_CITRAP_REPORT_OVERRIDE_SEARCH = True
 
 # Cap for maxReportCount on searchReports, even if the caller asks for more.
 OTS_CITRAP_REPORT_MAX_RESULTS_CEILING = 1000
@@ -41,6 +45,13 @@ OTS_CITRAP_REPORT_DEFAULT_MAX_RESULTS = 100
 
 # Log every CI-TRAP report create/update/delete/attachment at INFO level.
 OTS_CITRAP_REPORT_LOG_EVENTS = True
+
+# Verbose diagnostics: logs full request headers and dumps the contents
+# of every file inside uploaded payload zips. Invaluable when debugging
+# client/wire-format issues; expensive and noisy in normal operation
+# (decompresses and logs multi-MB media files on every upload) - leave
+# off unless actively troubleshooting.
+OTS_CITRAP_REPORT_DEBUG = False
 
 # Rows per page on the /ui report browser (GET {prefix}/ui).
 OTS_CITRAP_REPORT_UI_PAGE_SIZE = 50

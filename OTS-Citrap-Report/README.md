@@ -18,25 +18,35 @@ content-type `*/*` — genuinely opaque, not a defined JSON object — so this
 plugin passes bytes through rather than wrapping everything in JSON
 metadata. See "Response bodies" below for exactly what each op returns.
 
-## Important: collision with OTS core
+## EUD search — collision with OTS core, and how it's actually resolved
 
 **`GET /Marti/api/citrap` (searchReports) is the exact same path and method
-OTS core already documents as natively supported.** Flask/Werkzeug won't
-error on the duplicate rule, but whichever route got added to the URL map
-first wins silently — and core's routes register before plugins load, so
-this plugin's `searchReports` would never actually run by default.
+OTS core already documents as natively supported** — and empirically
+confirmed (a real EUD's in-app search returned nothing) that core's
+implementation has no knowledge of this plugin's report data, since core
+has no way to know this plugin's table exists.
 
-This plugin's default behavior: **skip registering `searchReports`
-entirely**, log a note explaining why, and let core handle that one path.
+A competing same-path Flask route does **not** fix this: confirmed against
+real Werkzeug 3.x, whichever rule was added to the URL map first (core's,
+since it registers before any plugin loads) always wins the match — there's
+no supported way for a plugin to remove or reorder that from outside
+Werkzeug's internals (its `StateMachineMatcher` builds an internal tree once
+and doesn't rebuild from the rules list on demand; verified directly against
+werkzeug 3.1.7). An earlier version of this plugin tried exactly that
+same-path-route approach and it silently never ran.
+
+**What actually works, verified end-to-end with a real Flask app** (core's
+route registered first, exactly matching real OTS startup order): a
+`before_app_request` hook, which runs before route dispatch for *every*
+request regardless of which rule Werkzeug matched. Returning a `Response`
+from it short-circuits Flask entirely — core's view function never runs.
+This is what `OTS_CITRAP_REPORT_OVERRIDE_SEARCH` (default **`true`**)
+controls. Set it `false` only if a future OTS version implements real
+`searchReports` behavior you'd rather defer to instead.
+
 The other five operations (`getReport`, `putReport`, `deleteReport`,
 `postReport`, `addAttachment`) don't overlap with anything core implements,
-so they're always registered.
-
-If you've confirmed your OTS version's core `GET /Marti/api/citrap` is a
-stub you actually want to replace, set `OTS_CITRAP_REPORT_OVERRIDE_SEARCH:
-true` in config.yml — but whether the override actually wins the route
-depends on plugin/blueprint registration order in your OTS version's
-`PluginManager`, which isn't guaranteed. Test it before relying on it.
+so they're always registered normally and are unaffected by any of this.
 
 ## Ownership / clientUid semantics
 
@@ -374,12 +384,20 @@ Add to `~/ots/config.yml`:
 OTS_CITRAP_REPORT_ENABLED: true
 OTS_CITRAP_REPORT_URL_PREFIX: "/Marti/api/citrap"
 OTS_CITRAP_REPORT_ADMIN_UI_PREFIX: "/api/citrap-reports"
-OTS_CITRAP_REPORT_OVERRIDE_SEARCH: false
+OTS_CITRAP_REPORT_OVERRIDE_SEARCH: true
 OTS_CITRAP_REPORT_MAX_RESULTS_CEILING: 1000
 OTS_CITRAP_REPORT_DEFAULT_MAX_RESULTS: 100
 OTS_CITRAP_REPORT_LOG_EVENTS: true
 OTS_CITRAP_REPORT_UI_PAGE_SIZE: 50
+OTS_CITRAP_REPORT_DEBUG: false
 ```
+
+`OTS_CITRAP_REPORT_DEBUG: true` re-enables the verbose wire-format
+diagnostics used while getting real EUD traffic working (full request
+headers, which body-parsing branch fired, and a dump of every file
+inside each uploaded payload zip). Expensive and noisy - it decompresses
+and logs multi-MB media on every upload - so leave it off unless actively
+troubleshooting a client that won't upload.
 
 Note: `OTS_CITRAP_REPORT_URL_PREFIX` and `OTS_CITRAP_REPORT_OVERRIDE_SEARCH`
 are read at plugin construction time (not live from `app.config`), so

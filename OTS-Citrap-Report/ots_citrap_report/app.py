@@ -16,19 +16,27 @@ response codes) - see README for the couple of things the spec leaves
 genuinely ambiguous (the "*/*" / bare "string" response bodies don't say
 what shape the payload takes beyond "opaque blob").
 
-Known collision with OTS core
-------------------------------
+Known collision with OTS core, and how it's actually resolved
+----------------------------------------------------------------
 "GET /Marti/api/citrap" (searchReports) is the exact same path+method OTS
-core already documents as natively supported. Registering the same rule
-again from a plugin blueprint doesn't raise an error, but whichever route
-was added to the URL map first wins silently - and core's routes are
-registered before plugins load, so this plugin's searchReports would never
-actually run unless OTS_CITRAP_REPORT_OVERRIDE_SEARCH is set (see
-default_config.py) AND your OTS version's plugin loader genuinely lets a
-plugin's rule take precedence, which isn't guaranteed. Default behavior:
-skip registering searchReports, log a note, and let core's implementation
-handle that one path. Everything else here (get/put/delete/post/attachment)
-doesn't overlap with anything core implements.
+core already documents as natively supported, and core's implementation
+has no knowledge of this plugin's report data (confirmed: a real EUD's
+search returned nothing until this override was in place). Registering a
+second Flask route for the identical path does NOT resolve this -
+confirmed against real Werkzeug 3.x, whichever rule was added to the URL
+map first (core's, since it registers before any plugin loads) always
+wins the match; there's no supported way for a plugin to remove or
+reorder that from outside Werkzeug's internals (its StateMachineMatcher
+builds an internal tree once and doesn't rebuild from the rules list on
+demand).
+
+What actually works: `before_app_request` runs before route dispatch for
+every request, regardless of which rule Werkzeug matched - returning a
+Response from it short-circuits Flask entirely before core's view
+function ever runs. See `_register_search_override` below.
+OTS_CITRAP_REPORT_OVERRIDE_SEARCH (default True) controls whether this
+hook is installed; set it False only if a future OTS version implements
+real searchReports behavior you'd rather defer to.
 
 Ownership / clientUid
 ----------------------
@@ -94,37 +102,51 @@ PLUGIN_NAME = "ots_citrap_report"
 DISTRO_NAME = "ots-citrap-report"
 
 
+def _debug_enabled() -> bool:
+    try:
+        return bool(app.config.get("OTS_CITRAP_REPORT_DEBUG", False))
+    except RuntimeError:
+        # No app context (e.g. called from a test harness) - stay quiet.
+        return False
+
+
 def _decode_byte_body(req, context: str = "") -> bytes:
     """
     putReport/postReport/addAttachment all declare requestBody
-    application/json, schema {type: string, format: byte} - i.e. the body
-    is a base64-encoded JSON string, not a JSON object. Tolerate a couple
-    of reasonable variants too.
+    application/json, schema {type: string, format: byte} in the OpenAPI
+    spec - but real ATAK traffic (confirmed on the wire) sends raw
+    application/x-zip-compressed bytes instead, which lands in the
+    req.data branch below. The JSON branches are kept for spec-compliant
+    clients, should any exist.
 
-    TEMPORARY: logs content-type/length/headers and which branch actually
-    fires, to nail down what real EUD traffic looks like on the wire -
-    remove once the request/response format is confirmed working
-    end-to-end.
+    Verbose wire-format diagnostics (headers, branch taken) only log when
+    OTS_CITRAP_REPORT_DEBUG is enabled - they were essential for nailing
+    down the real payload format initially, but are noise in normal
+    operation.
     """
-    logger.info(
-        f"ots_citrap_report[{context}]: Content-Type={req.content_type!r} "
-        f"Content-Length={req.content_length!r} Accept={req.headers.get('Accept')!r} "
-        f"User-Agent={req.headers.get('User-Agent')!r} "
-        f"all_headers={dict(req.headers)!r}"
-    )
+    if _debug_enabled():
+        logger.info(
+            f"ots_citrap_report[{context}]: Content-Type={req.content_type!r} "
+            f"Content-Length={req.content_length!r} Accept={req.headers.get('Accept')!r} "
+            f"User-Agent={req.headers.get('User-Agent')!r} "
+            f"all_headers={dict(req.headers)!r}"
+        )
 
     body = req.get_json(silent=True)
     if isinstance(body, str):
-        logger.info(f"ots_citrap_report[{context}]: parsed as JSON string, len={len(body)}")
+        if _debug_enabled():
+            logger.info(f"ots_citrap_report[{context}]: parsed as JSON string, len={len(body)}")
         raw = body
     elif isinstance(body, dict) and "data" in body:
-        logger.info(f"ots_citrap_report[{context}]: parsed as JSON dict with 'data' key")
+        if _debug_enabled():
+            logger.info(f"ots_citrap_report[{context}]: parsed as JSON dict with 'data' key")
         raw = body["data"]
     elif req.data:
-        logger.info(
-            f"ots_citrap_report[{context}]: not valid JSON - using raw request body, "
-            f"{len(req.data)} bytes, first 16 bytes={req.data[:16]!r}"
-        )
+        if _debug_enabled():
+            logger.info(
+                f"ots_citrap_report[{context}]: not valid JSON - using raw request body, "
+                f"{len(req.data)} bytes, first 16 bytes={req.data[:16]!r}"
+            )
         return req.data
     else:
         raise ValueError("Request body must be a base64-encoded JSON string")
@@ -144,6 +166,26 @@ def _parse_iso(value):
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _apply_metadata_to_report(report, metadata: dict):
+    """Copy whichever searchable/sortable fields were successfully
+    extracted from the payload onto the report row. Deliberately does NOT
+    touch report.id - id semantics differ per route (postReport reuses
+    the payload's embedded id; putReport's id is URL-authoritative)."""
+    if "type" in metadata:
+        report.type = metadata["type"]
+    if "callsign" in metadata:
+        report.callsign = metadata["callsign"]
+    if "title" in metadata:
+        report.title = metadata["title"]
+    if "importance" in metadata:
+        report.importance = metadata["importance"]
+    if "report_datetime" in metadata:
+        report.report_datetime = metadata["report_datetime"]
+    if "lat" in metadata and "lon" in metadata:
+        report.lat = metadata["lat"]
+        report.lon = metadata["lon"]
 
 
 def _log_zip_contents(payload: bytes, context: str = ""):
@@ -283,6 +325,22 @@ def _extract_report_xml_element(payload: bytes):
         logger.debug("ots_citrap_report: error parsing report xml from zip", exc_info=True)
         return None
     return None
+
+
+def _extract_raw_report_attrs(payload: bytes):
+    """
+    Returns the <report> root element's own attributes as a plain dict -
+    id, type, title, userCallsign, dateTime, location, importance,
+    status, etc, using ATAK's OWN attribute names exactly as it wrote
+    them into report.xml. Used for searchReports: a client's own JSON
+    deserializer is far more likely to recognize its own native field
+    names than any renamed schema a server might invent. Returns None if
+    the payload isn't a parseable data package zip.
+    """
+    root = _extract_report_xml_element(payload)
+    if root is None:
+        return None
+    return dict(root.attrib)
 
 
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".heic", ".heif"}
@@ -892,6 +950,24 @@ class OtsCitrapReport(Plugin):
         self.admin_blueprint = Blueprint(
             "ots_citrap_report_admin", __name__, url_prefix=OTS_CITRAP_REPORT_ADMIN_UI_PREFIX
         )
+        # PluginManager calls activate() every time this plugin's enabled
+        # state is toggled via the OTS web UI, not just once at boot -
+        # register_blueprint() must only ever be called once per process
+        # (Flask raises AssertionError if called after the app has served
+        # its first request, which every toggle-after-boot triggers; even
+        # setup-phase, Flask doesn't support registering the same
+        # blueprint twice). This flag prevents the crash on every
+        # subsequent enable/disable click after the first activate() call.
+        self._admin_blueprint_registered = False
+
+        # OTS's own per-plugin enabled/disabled state, as passed into
+        # activate(enabled=...) by PluginManager - tracked here so route
+        # handlers can actually honor it (previously they only checked
+        # OTS_CITRAP_REPORT_ENABLED, this plugin's own separate config
+        # flag, meaning toggling "Disable" on the Plugins page did
+        # nothing to the routes at all). Defaults True since activate()
+        # hasn't necessarily run yet when this is read.
+        self._ots_enabled = True
 
         self._created_hooks = []
         self._updated_hooks = []
@@ -934,7 +1010,7 @@ class OtsCitrapReport(Plugin):
         bp = self.blueprint
 
         def enabled():
-            return app.config.get("OTS_CITRAP_REPORT_ENABLED", True)
+            return self._ots_enabled and app.config.get("OTS_CITRAP_REPORT_ENABLED", True)
 
         def log_event(msg):
             if app.config.get("OTS_CITRAP_REPORT_LOG_EVENTS", True):
@@ -954,11 +1030,27 @@ class OtsCitrapReport(Plugin):
                 return Response("clientUid is required", status=400)
 
             report = db.session.get(CitrapReport, id)
+
+            if _debug_enabled():
+                logger.info(
+                    f"ots_citrap_report[getReport]: id={id!r} clientUid={client_uid!r} "
+                    f"found={report is not None} "
+                    f"owner_match={report.client_uid == client_uid if report else None} "
+                    f"Accept={request.headers.get('Accept')!r} User-Agent={request.headers.get('User-Agent')!r}"
+                )
+
             if report is None:
                 return Response("not found", status=404)
-            if not _check_owner(report, client_uid):
-                return Response("forbidden", status=403)
 
+            # NOT owner-restricted, unlike putReport/deleteReport/
+            # addAttachment: searchReports is deliberately unscoped (any
+            # client can search all reports), so a client reading a
+            # specific report it found via search - one it didn't
+            # necessarily submit itself - needs to actually succeed, or
+            # the collaborative "search then open" workflow is broken for
+            # every EUD except the original submitter. clientUid is still
+            # required (matches the spec) and still logged, just not
+            # enforced as an ownership check for reads.
             return Response(report.payload, status=200, mimetype="application/octet-stream")
 
         # -- putReport: PUT /Marti/api/citrap/{id}?clientUid=... ---------
@@ -991,6 +1083,14 @@ class OtsCitrapReport(Plugin):
                 report.set_payload(payload)
                 created = False
 
+            # Extract searchable/sortable metadata from the payload, same
+            # as postReport does - without this, PUT-submitted reports
+            # would store fine but show blank title/callsign/type/etc in
+            # search and the admin list. Unlike postReport, the id here is
+            # URL-authoritative (PUT names its resource), so any embedded
+            # id in the payload is deliberately ignored.
+            _apply_metadata_to_report(report, _extract_report_metadata_from_zip(payload))
+
             db.session.commit()
             log_event(f"report {id} {'created' if created else 'updated'} by {client_uid}")
             self._fire(self._created_hooks if created else self._updated_hooks, report)
@@ -1021,20 +1121,40 @@ class OtsCitrapReport(Plugin):
             return Response("", status=200)
 
         # -- searchReports: GET /Marti/api/citrap -------------------------
-        # Only registered if OTS_CITRAP_REPORT_OVERRIDE_SEARCH is set - see
-        # the module docstring re: the collision with core's existing
-        # "GET /Marti/api/citrap". Read statically (not from live
-        # app.config) since blueprint/route registration happens at plugin
-        # construction time, before an app context is guaranteed to exist.
-        # A config.yml override of this flag takes effect on restart.
+        # "GET /Marti/api/citrap" is the exact same path+method OTS core
+        # documents as natively supported - and empirically (confirmed via
+        # a real EUD reporting empty search results, then verified against
+        # actual Werkzeug 3.x behavior), core's rule wins any routing
+        # precedence race since it's registered before plugins load.
+        # Simply adding a competing @bp.route("") for the same path,
+        # gated by OTS_CITRAP_REPORT_OVERRIDE_SEARCH, does NOT work -
+        # Werkzeug's StateMachineMatcher matches whichever rule was added
+        # first, full stop, and removing/rebuilding that matcher's
+        # internal tree from a plugin isn't something Werkzeug exposes a
+        # supported way to do.
+        #
+        # What DOES reliably work (confirmed with real Flask + Werkzeug):
+        # before_app_request runs before route dispatch for every request
+        # regardless of which rule Werkzeug matched, and returning a
+        # Response from it short-circuits Flask entirely - core's view
+        # function never even runs. Registered only when
+        # OTS_CITRAP_REPORT_OVERRIDE_SEARCH is set (default True, since
+        # core's own implementation has been confirmed to return nothing
+        # for report data it has no knowledge of - EUD search is broken
+        # without this override on every OTS install this plugin runs
+        # on). Read statically (not from live app.config) since blueprint
+        # registration happens at plugin construction time, before an app
+        # context is guaranteed to exist; a config.yml change to this
+        # flag takes effect on restart.
         if OTS_CITRAP_REPORT_OVERRIDE_SEARCH:
-            self._register_search_route(bp, enabled, log_event)
+            self._register_search_override(bp, enabled, log_event)
         else:
             logger.info(
-                "ots_citrap_report: skipping searchReports route (GET /Marti/api/citrap) "
-                "because it collides with a route OTS core already documents; "
-                "set OTS_CITRAP_REPORT_OVERRIDE_SEARCH=true to attempt registering it anyway."
+                "ots_citrap_report: OTS_CITRAP_REPORT_OVERRIDE_SEARCH is disabled - "
+                "EUD searches (GET /Marti/api/citrap) will hit OTS core's own "
+                "implementation instead of this plugin's report data."
             )
+
 
         # -- postReport: POST /Marti/api/citrap?clientUid=... ------------
         @bp.route("", methods=["POST"], endpoint="citrap_post_report")
@@ -1051,7 +1171,8 @@ class OtsCitrapReport(Plugin):
             except ValueError as e:
                 return Response(str(e), status=400)
 
-            _log_zip_contents(payload, context="postReport")
+            if _debug_enabled():
+                _log_zip_contents(payload, context="postReport")
 
             metadata = _extract_report_metadata_from_zip(payload)
             extracted_id = metadata.get("id")
@@ -1079,35 +1200,25 @@ class OtsCitrapReport(Plugin):
                 db.session.add(report)
                 created = True
 
-            if "type" in metadata:
-                report.type = metadata["type"]
-            if "callsign" in metadata:
-                report.callsign = metadata["callsign"]
-            if "title" in metadata:
-                report.title = metadata["title"]
-            if "importance" in metadata:
-                report.importance = metadata["importance"]
-            if "report_datetime" in metadata:
-                report.report_datetime = metadata["report_datetime"]
-            if "lat" in metadata and "lon" in metadata:
-                report.lat = metadata["lat"]
-                report.lon = metadata["lon"]
+            _apply_metadata_to_report(report, metadata)
 
             db.session.commit()
 
-            logger.info(
-                f"ots_citrap_report[postReport]: using "
-                f"{'client-supplied' if extracted_id else 'server-generated'} id {report.id}"
-            )
+            if _debug_enabled():
+                logger.info(
+                    f"ots_citrap_report[postReport]: using "
+                    f"{'client-supplied' if extracted_id else 'server-generated'} id {report.id}"
+                )
             log_event(f"report {report.id} {'created' if created else 'updated'} by {client_uid}")
             self._fire(self._created_hooks if created else self._updated_hooks, report)
 
             resp_body = report.id
             location = f"{OTS_CITRAP_REPORT_URL_PREFIX}/{report.id}"
-            logger.info(
-                f"ots_citrap_report[postReport]: responding status=201 "
-                f"Content-Type=text/plain Location={location!r} body={resp_body!r}"
-            )
+            if _debug_enabled():
+                logger.info(
+                    f"ots_citrap_report[postReport]: responding status=201 "
+                    f"Content-Type=text/plain Location={location!r} body={resp_body!r}"
+                )
             resp = Response(resp_body, status=201, mimetype="text/plain")
             resp.headers["Location"] = location
             return resp
@@ -1351,11 +1462,22 @@ class OtsCitrapReport(Plugin):
                 "", status=303, headers={"Location": request.url_root.rstrip("/") + OTS_CITRAP_REPORT_ADMIN_UI_PREFIX}
             )
 
-    def _register_search_route(self, bp, enabled, log_event):
-        @bp.route("", methods=["GET"], endpoint="citrap_search_reports")
-        def search_reports():
+    def _register_search_override(self, bp, enabled, log_event):
+        @bp.before_app_request
+        def search_reports_override():
+            if request.method != "GET" or request.path != OTS_CITRAP_REPORT_URL_PREFIX:
+                return None  # not our path - let normal dispatch continue
+
             if not enabled():
                 return Response("disabled", status=503)
+
+            if _debug_enabled():
+                logger.info(
+                    f"ots_citrap_report[searchReports]: Accept={request.headers.get('Accept')!r} "
+                    f"User-Agent={request.headers.get('User-Agent')!r} "
+                    f"query_string={request.query_string.decode('utf-8', errors='replace')!r} "
+                    f"all_headers={dict(request.headers)!r}"
+                )
 
             # clientUid is OPTIONAL here (unlike every other operation) -
             # treat it as a filter, not a required scope.
@@ -1395,17 +1517,14 @@ class OtsCitrapReport(Plugin):
             # Take min/max per axis rather than assuming which corner comes
             # first, so this works regardless of corner ordering convention.
             # Only matches reports whose lat/lon were successfully extracted
-            # from a CoT payload (see models.extract_latlon_from_cot) - a
-            # report with a non-CoT/unparseable payload has lat/lon = None
-            # and will never match a bbox filter.
+            # from the payload - a report with an unparseable payload has
+            # lat/lon = None and will never match a bbox filter.
             bbox = request.args.get("bbox")
             if bbox:
                 try:
                     lon1, lat1, lon2, lat2 = (float(v) for v in bbox.split(","))
                 except ValueError:
-                    return Response(
-                        "bbox must be 'lon1,lat1,lon2,lat2'", status=400
-                    )
+                    return Response("bbox must be 'lon1,lat1,lon2,lat2'", status=400)
                 min_lon, max_lon = min(lon1, lon2), max(lon1, lon2)
                 min_lat, max_lat = min(lat1, lat2), max(lat1, lat2)
                 query = query.filter(
@@ -1433,7 +1552,43 @@ class OtsCitrapReport(Plugin):
                     "(not yet pushed - wire this into on_report_created if needed)"
                 )
 
-            body = json.dumps([r.to_dict(include_payload=False) for r in results])
+            log_event(f"searchReports matched {len(results)} report(s) for client {client_uid or '<any>'}")
+
+            # First attempt returned our own metadata schema (id,
+            # clientUid, type, ...) as JSON objects - the client showed
+            # "success" but displayed zero results, i.e. it parsed an
+            # array of objects fine but didn't recognize our field names.
+            # Second attempt returned an array of raw base64 payload
+            # strings (matching the opaque-bytes convention every OTHER
+            # operation in this API uses) - that CRASHED the client on
+            # positive results, consistent with a typed JSON deserializer
+            # (e.g. Gson/Jackson) expecting objects and hard-failing a
+            # type mismatch on bare strings instead of just ignoring them.
+            #
+            # This third attempt: an array of objects again (matching
+            # what didn't crash), but using ATAK's OWN <report> XML
+            # attribute names (id, type, title, userCallsign, dateTime,
+            # location, importance, status, ...) instead of an invented
+            # schema - since ATAK generated that XML itself, its own
+            # deserializer is far more likely to recognize its own native
+            # field names. Reports whose payload isn't a parseable data
+            # package zip are skipped entirely rather than sent as
+            # empty/malformed objects, in case that also risks a crash.
+            report_objs = []
+            for r in results:
+                attrs = _extract_raw_report_attrs(r.payload)
+                if attrs:
+                    report_objs.append(attrs)
+
+            body = json.dumps(report_objs)
+
+            if _debug_enabled():
+                logger.info(
+                    f"ots_citrap_report[searchReports]: responding status=200 "
+                    f"Content-Type=application/json {len(report_objs)}/{len(results)} report(s) "
+                    f"parsed into objects, body preview={body[:500]!r}{'...' if len(body) > 500 else ''}"
+                )
+
             return Response(body, status=200, mimetype="application/json")
 
     # ------------------------------------------------------------------
@@ -1445,15 +1600,38 @@ class OtsCitrapReport(Plugin):
     # ------------------------------------------------------------------
     def activate(self, app, enabled: bool) -> None:
         self._app = app
+        self._ots_enabled = enabled
         self.load_metadata()
 
         # PluginManager only auto-registers self.blueprint (singular) -
         # self.admin_blueprint (the browser-facing admin UI, deliberately
         # NOT under /Marti/* - see its docstring) needs registering by
-        # hand. Done unconditionally, matching how PluginManager registers
-        # self.blueprint regardless of enabled state - the enabled check
-        # happens per-request inside the route handlers instead.
-        app.register_blueprint(self.admin_blueprint)
+        # hand. PluginManager calls activate() every time this plugin's
+        # enabled state is toggled via the OTS web UI, not just once at
+        # boot - only attempt this once per process (Flask forbids
+        # calling register_blueprint after the app has served its first
+        # request, which every toggle-after-boot triggers, and doesn't
+        # support registering the same blueprint twice regardless). If
+        # the plugin starts disabled and only gets enabled well after
+        # boot, even this first attempt can happen too late - caught and
+        # logged clearly rather than crashing the enable action, since a
+        # full server restart (not just re-toggling) is the only way to
+        # pick up the admin UI routes at that point.
+        if not self._admin_blueprint_registered:
+            try:
+                app.register_blueprint(self.admin_blueprint)
+                self._admin_blueprint_registered = True
+            except AssertionError:
+                logger.error(
+                    "ots_citrap_report: could not register the admin UI blueprint - "
+                    "the server has already started handling requests. This happens "
+                    "when the plugin is left disabled through boot and enabled later "
+                    "via the web UI rather than at startup. The Marti protocol routes "
+                    "(report upload/search/etc) are unaffected and already active - "
+                    "only the admin UI at "
+                    f"{OTS_CITRAP_REPORT_ADMIN_UI_PREFIX} needs a full OTS restart "
+                    "(not just re-toggling enable/disable) to become reachable."
+                )
 
         # NOTE: previously called self.get_plugin_routes(...) here, a
         # method inherited from Plugin whose actual return shape and
@@ -1533,7 +1711,11 @@ class OtsCitrapReport(Plugin):
     def stop(self) -> None:
         # No background threads, open sockets, or scheduled jobs to tear
         # down - this plugin only adds request-scoped DB-backed routes.
-        pass
+        # Disabling via the Plugins page calls this (not activate() with
+        # enabled=False), so this is where route handlers' enabled()
+        # check actually needs to flip - without this, "Disable" on the
+        # Plugins page wouldn't stop the routes from working at all.
+        self._ots_enabled = False
 
     def get_info(self) -> dict | None:
         # Every value here is a plain str/list-of-str deliberately - see
