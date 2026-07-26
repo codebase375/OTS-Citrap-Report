@@ -34,9 +34,6 @@ Postgres tables, installable through OTS's normal plugin flow.
 
 # This project heavily leveraged Claude for implementation and is still not perfect. #
 
-Problem Points:
-* The Admin UI won't cooperate with the plugin UI page
-
 Help is appreciated for a further and properly fleshed out implementation. 
 
 
