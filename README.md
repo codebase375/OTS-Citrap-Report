@@ -1,4 +1,4 @@
-# OTS-Citrap-Report — Project Summary
+# OTS-Reports-Plugin — Project Summary
 
 ## What it is
 
